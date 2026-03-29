@@ -125,16 +125,16 @@ PROMPT_ISSUE = """
 """.strip()
 
 PROMPT_RESEARCH = """
-あなたは経営・IT戦略の調査専門家です。
-WebSearchとWebFetchを使い、与えられたテーマに関するベストプラクティスを調査してください。
+あなたは経営・IT戦略の専門家です。
+あなたの知識に基づき、与えられたテーマに関するベストプラクティスをまとめてください。
 
-調査対象：
+対象：
 1. IT投資管理・ITポートフォリオ管理のグローバルベストプラクティス
 2. 代表的フレームワーク（Gartner・McKinsey・ITIL・COBIT等）
-3. 大規模システムリプレースの成功・失敗事例
+3. 大規模システムリプレースの成功・失敗事例と教訓
 4. 日本企業での適用事例と留意点
 
-調査結果を日本語でわかりやすくまとめてください。
+日本語でわかりやすくまとめてください。
 """.strip()
 
 PROMPT_IMPLEMENT = """
@@ -249,11 +249,11 @@ async def run_pipeline(theme: str, background: str) -> dict:
         "Step 1: イシュー整理",
     )
 
-    # Step 2: ベストプラクティス調査（Web検索）
-    results["research"] = await run_with_search(
+    # Step 2: ベストプラクティス調査（LLM知識ベース）
+    results["research"] = await run_stream(
         PROMPT_RESEARCH,
         f"テーマ: {theme}\n\nイシュー整理結果:\n{results['issue']}",
-        "Step 2: ベストプラクティス調査（Web検索）",
+        "Step 2: ベストプラクティス調査",
     )
 
     # Step 3: 300人規模での実現方法
