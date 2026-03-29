@@ -1,125 +1,110 @@
 #!/usr/bin/env python3
 """
-経営資料作成マルチエージェントパイプライン
+経営資料作成マルチエージェントパイプライン（Agent SDK版）
+APIキー不要 — Claude Code の認証をそのまま利用
 
 【ステップ構成】
   1. イシュー整理
   2. ベストプラクティス調査（Web検索）
-  3. 300人規模での実現方法検討
+  3. 300人規模での実現方法
   4. 論点ツリー・ストーリー作成
   5. 文書作成（初稿）
   6. 9視点からの反論（並列実行）
-     IT部門 / 財務(CFO) / 事業部門 / CISO / CRO / CEO / 取締役 / 金融庁 / 利用者
   7. 反論を踏まえた資料修正
   8. 想定問答作成
 
 【使い方】
-  pip install anthropic
-  export ANTHROPIC_API_KEY=your_key
   python document_pipeline.py
   python document_pipeline.py "テーマ名"
 """
 
 import asyncio
 import sys
-import anthropic
 from datetime import datetime
 
-# ─────────────────────────────────────────────────────────────
-# 設定
-# ─────────────────────────────────────────────────────────────
-
-MODEL = "claude-opus-4-6"
-TOKENS_NORMAL   = 3000   # 通常ステップ
-TOKENS_DOCUMENT = 6000   # 文書作成・修正ステップ
-TOKENS_CRITIQUE = 1500   # 反論ステップ（並列）
-TOKENS_QA       = 4000   # 想定問答
-
-client = anthropic.AsyncAnthropic()
+from claude_agent_sdk import (
+    query,
+    ClaudeAgentOptions,
+    ResultMessage,
+    AssistantMessage,
+    TextBlock,
+)
 
 
 # ─────────────────────────────────────────────────────────────
 # エージェント実行ヘルパー
 # ─────────────────────────────────────────────────────────────
 
-async def run_stream(system: str, user: str, label: str, max_tokens: int = TOKENS_NORMAL) -> str:
-    """逐次処理用：ストリーミングでリアルタイム出力"""
+async def run_stream(system: str, user: str, label: str) -> str:
+    """逐次処理用：テキストをリアルタイム表示"""
     print(f"\n{'─' * 60}")
     print(f"▶ {label}")
     print(f"{'─' * 60}")
 
-    text = ""
-    async with client.messages.stream(
-        model=MODEL,
-        max_tokens=max_tokens,
-        thinking={"type": "adaptive"},
-        system=system,
-        messages=[{"role": "user", "content": user}],
-    ) as stream:
-        async for chunk in stream.text_stream:
-            text += chunk
-            print(chunk, end="", flush=True)
+    result = ""
+    async for message in query(
+        prompt=user,
+        options=ClaudeAgentOptions(
+            system_prompt=system,
+            allowed_tools=[],
+            max_turns=5,
+        ),
+    ):
+        if isinstance(message, AssistantMessage):
+            for block in message.content:
+                if isinstance(block, TextBlock):
+                    print(block.text, end="", flush=True)
+        elif isinstance(message, ResultMessage):
+            result = message.result
 
     print()
-    return text
+    return result
 
 
-async def run_silent(system: str, user: str, label: str, max_tokens: int = TOKENS_CRITIQUE) -> str:
-    """並列処理用：サイレントで実行（出力は後でまとめて表示）"""
+async def run_with_search(system: str, user: str, label: str) -> str:
+    """Web検索あり：WebSearch / WebFetch ツールを使用"""
+    print(f"\n{'─' * 60}")
+    print(f"▶ {label}")
+    print(f"{'─' * 60}")
+
+    result = ""
+    async for message in query(
+        prompt=user,
+        options=ClaudeAgentOptions(
+            system_prompt=system,
+            allowed_tools=["WebSearch", "WebFetch"],
+            max_turns=20,
+        ),
+    ):
+        if isinstance(message, AssistantMessage):
+            for block in message.content:
+                if isinstance(block, TextBlock):
+                    print(block.text, end="", flush=True)
+        elif isinstance(message, ResultMessage):
+            result = message.result
+
+    print()
+    return result
+
+
+async def run_silent(system: str, user: str, label: str) -> str:
+    """並列処理用：サイレント実行（9ペルソナ同時起動）"""
     print(f"  ・{label} 生成中...", flush=True)
 
-    response = await client.messages.create(
-        model=MODEL,
-        max_tokens=max_tokens,
-        thinking={"type": "adaptive"},
-        system=system,
-        messages=[{"role": "user", "content": user}],
-    )
+    result = ""
+    async for message in query(
+        prompt=user,
+        options=ClaudeAgentOptions(
+            system_prompt=system,
+            allowed_tools=[],
+            max_turns=5,
+        ),
+    ):
+        if isinstance(message, ResultMessage):
+            result = message.result
 
-    text = "".join(
-        b.text for b in response.content
-        if getattr(b, "type", "") == "text"
-    )
     print(f"  ✓ {label} 完了")
-    return text
-
-
-async def run_with_search(system: str, user: str, label: str, max_tokens: int = TOKENS_NORMAL) -> str:
-    """Web検索あり：サーバーサイドツール + pause_turnループ対応"""
-    print(f"\n{'─' * 60}")
-    print(f"▶ {label}")
-    print(f"{'─' * 60}")
-
-    messages = [{"role": "user", "content": user}]
-    text = ""
-
-    for _ in range(6):  # pause_turn 連続時の上限
-        response = await client.messages.create(
-            model=MODEL,
-            max_tokens=max_tokens,
-            thinking={"type": "adaptive"},
-            system=system,
-            tools=[{"type": "web_search_20260209", "name": "web_search"}],
-            messages=messages,
-        )
-
-        for block in response.content:
-            if getattr(block, "type", "") == "text":
-                print(block.text, end="", flush=True)
-                text += block.text
-
-        if response.stop_reason == "end_turn":
-            break
-
-        if response.stop_reason == "pause_turn":
-            # サーバーサイドツールのイテレーション上限に達した → 再送信して継続
-            messages.append({"role": "assistant", "content": response.content})
-            continue
-
-        break  # その他の stop_reason
-
-    print()
-    return text
+    return result
 
 
 # ─────────────────────────────────────────────────────────────
@@ -131,7 +116,7 @@ PROMPT_ISSUE = """
 
 以下の観点で整理してください：
 1. 核心イシュー（問題の本質は何か）
-2. 解決すべき論点リスト（MECE に）
+2. 解決すべき論点リスト（MECEに）
 3. 前提条件と制約
 4. 主要ステークホルダーとその関心
 5. 成功の定義・KPI
@@ -141,11 +126,11 @@ PROMPT_ISSUE = """
 
 PROMPT_RESEARCH = """
 あなたは経営・IT戦略の調査専門家です。
-Web検索を使い、与えられたテーマに関するベストプラクティスを調査してください。
+WebSearchとWebFetchを使い、与えられたテーマに関するベストプラクティスを調査してください。
 
 調査対象：
 1. IT投資管理・ITポートフォリオ管理のグローバルベストプラクティス
-2. 代表的フレームワーク（Gartner・McKinsey・ITIL・COBIT 等）
+2. 代表的フレームワーク（Gartner・McKinsey・ITIL・COBIT等）
 3. 大規模システムリプレースの成功・失敗事例
 4. 日本企業での適用事例と留意点
 
@@ -177,8 +162,7 @@ PROMPT_STORY = """
    - 雨：分析・示唆
    - 傘：提言・アクション
 
-MECE を徹底し、経営会議で最大の説得力を持つ構成を設計してください。
-日本語で。
+MECEを徹底し、経営会議で最大の説得力を持つ構成を設計してください。日本語で。
 """.strip()
 
 PROMPT_WRITE = """
@@ -196,7 +180,7 @@ Markdown形式で、経営会議向けの資料を作成してください。
 8. リスクと対応方針
 9. 今後のアクション
 
-経営層が読む資料として、簡潔かつ説得力のある内容にしてください。
+経営層が読む資料として、簡潔かつ説得力のある内容に。
 固有名詞は「○○」のプレースホルダーを使用してください。
 """.strip()
 
@@ -205,9 +189,8 @@ PROMPT_REVISE = """
 初稿資料と複数ステークホルダーからの反論を踏まえ、資料を改善してください。
 
 改善の方針：
-- すべての反論を盲目的に取り込むのではなく、重要度・妥当性で選別する
+- すべての反論を盲目的に取り込まず、重要度・妥当性で選別する
 - 取り込む反論は資料に明示的に反映する
-- 取り込まない反論についても、想定問答で対応できる準備をする
 - 説得力と完成度を高める
 
 Markdown形式で改善版を出力してください。
@@ -223,12 +206,9 @@ PROMPT_QA = """
 **A：** 回答内容
 ---
 
-最低15問、主要論点を網羅してください。
-難問・鋭い質問も含め、実際の会議で使える回答を作成してください。
-日本語で。
+最低15問、主要論点を網羅。難問・鋭い質問も含め、実際の会議で使える回答を。日本語で。
 """.strip()
 
-# ─── 反論用プロンプト（各ペルソナ）────────────────────────
 
 def critic_prompt(persona: str, focus: str) -> str:
     return f"""
@@ -238,9 +218,9 @@ def critic_prompt(persona: str, focus: str) -> str:
 特に以下の観点から具体的な問題点を指摘してください：
 {focus}
 
-遠慮なく、鋭く指摘してください。曖昧な反論ではなく、具体的に。
-日本語で。
+遠慮なく、鋭く指摘してください。曖昧な反論ではなく、具体的に。日本語で。
 """.strip()
+
 
 CRITICS = [
     ("IT部門長",      "技術的実現可能性・IT部門の負荷・スケジュールの妥当性・技術的リスク・アーキテクチャ上の懸念"),
@@ -262,21 +242,21 @@ CRITICS = [
 async def run_pipeline(theme: str, background: str) -> dict:
     results = {}
 
-    # ── Step 1: イシュー整理 ──────────────────────────
+    # Step 1: イシュー整理
     results["issue"] = await run_stream(
         PROMPT_ISSUE,
         f"テーマ: {theme}\n\n背景情報:\n{background}",
         "Step 1: イシュー整理",
     )
 
-    # ── Step 2: ベストプラクティス調査（Web検索）──────
+    # Step 2: ベストプラクティス調査（Web検索）
     results["research"] = await run_with_search(
         PROMPT_RESEARCH,
         f"テーマ: {theme}\n\nイシュー整理結果:\n{results['issue']}",
         "Step 2: ベストプラクティス調査（Web検索）",
     )
 
-    # ── Step 3: 300人規模での実現方法 ─────────────────
+    # Step 3: 300人規模での実現方法
     results["implement"] = await run_stream(
         PROMPT_IMPLEMENT,
         (
@@ -287,7 +267,7 @@ async def run_pipeline(theme: str, background: str) -> dict:
         "Step 3: 300人規模での実現方法",
     )
 
-    # ── Step 4: 論点ツリー・ストーリー ────────────────
+    # Step 4: 論点ツリー・ストーリー
     results["story"] = await run_stream(
         PROMPT_STORY,
         (
@@ -298,7 +278,7 @@ async def run_pipeline(theme: str, background: str) -> dict:
         "Step 4: 論点ツリー・ストーリー作成",
     )
 
-    # ── Step 5: 文書作成（初稿）───────────────────────
+    # Step 5: 文書作成（初稿）
     results["draft"] = await run_stream(
         PROMPT_WRITE,
         (
@@ -309,34 +289,27 @@ async def run_pipeline(theme: str, background: str) -> dict:
             f"ストーリーライン:\n{results['story']}"
         ),
         "Step 5: 文書作成（初稿）",
-        max_tokens=TOKENS_DOCUMENT,
     )
 
-    # ── Step 6: 9ペルソナの反論（並列実行）────────────
+    # Step 6: 9ペルソナの反論（並列実行）
     print(f"\n{'─' * 60}")
     print("▶ Step 6: 反論生成（9ペルソナ 並列実行）")
     print(f"{'─' * 60}")
 
-    draft_message = f"以下の資料に対して、あなたの立場から徹底的に反論してください。\n\n{results['draft']}"
+    draft_msg = f"以下の資料に対して、あなたの立場から徹底的に反論してください。\n\n{results['draft']}"
 
     critique_tasks = [
-        run_silent(
-            critic_prompt(persona, focus),
-            draft_message,
-            persona,
-        )
+        run_silent(critic_prompt(persona, focus), draft_msg, persona)
         for persona, focus in CRITICS
     ]
-
     critique_results = await asyncio.gather(*critique_tasks)
     results["critiques"] = {p: r for (p, _), r in zip(CRITICS, critique_results)}
 
-    # ── Step 7: 資料修正 ───────────────────────────────
+    # Step 7: 資料修正
     critiques_text = "\n\n".join(
         f"### {p}からの反論\n{r}"
         for p, r in results["critiques"].items()
     )
-
     results["revised"] = await run_stream(
         PROMPT_REVISE,
         (
@@ -344,10 +317,9 @@ async def run_pipeline(theme: str, background: str) -> dict:
             f"【各ステークホルダーからの反論】\n{critiques_text}"
         ),
         "Step 7: 資料修正（最終版）",
-        max_tokens=TOKENS_DOCUMENT,
     )
 
-    # ── Step 8: 想定問答 ───────────────────────────────
+    # Step 8: 想定問答
     results["qa"] = await run_stream(
         PROMPT_QA,
         (
@@ -355,7 +327,6 @@ async def run_pipeline(theme: str, background: str) -> dict:
             f"【各ステークホルダーからの反論（参考）】\n{critiques_text}"
         ),
         "Step 8: 想定問答作成",
-        max_tokens=TOKENS_QA,
     )
 
     return results
@@ -369,23 +340,20 @@ def save_output(theme: str, results: dict) -> str:
     ts = datetime.now().strftime("%Y%m%d_%H%M%S")
     filename = f"pipeline_output_{ts}.md"
 
-    sections = [
-        ("Step 1: イシュー整理",         results["issue"]),
-        ("Step 2: ベストプラクティス調査", results["research"]),
-        ("Step 3: 300人規模での実現方法", results["implement"]),
-        ("Step 4: 論点ツリー・ストーリー", results["story"]),
-        ("Step 5: 文書初稿",             results["draft"]),
-        ("Step 7: 修正版資料（最終）",    results["revised"]),
-        ("Step 8: 想定問答",             results["qa"]),
-    ]
-
     with open(filename, "w", encoding="utf-8") as f:
         f.write(f"# {theme}\n")
-        f.write(f"生成日時: {datetime.now().strftime('%Y年%m月%d日 %H:%M:%S')}\n\n")
-        f.write("---\n\n")
+        f.write(f"生成日時: {datetime.now().strftime('%Y年%m月%d日 %H:%M:%S')}\n\n---\n\n")
 
-        for title, content in sections:
-            f.write(f"## {title}\n\n{content}\n\n")
+        for title, key in [
+            ("Step 1: イシュー整理",          "issue"),
+            ("Step 2: ベストプラクティス調査", "research"),
+            ("Step 3: 300人規模での実現方法",  "implement"),
+            ("Step 4: 論点ツリー・ストーリー", "story"),
+            ("Step 5: 文書初稿",              "draft"),
+            ("Step 7: 修正版資料（最終）",     "revised"),
+            ("Step 8: 想定問答",              "qa"),
+        ]:
+            f.write(f"## {title}\n\n{results[key]}\n\n")
 
         f.write("## Step 6: 各ステークホルダーからの反論\n\n")
         for persona, critique in results["critiques"].items():
@@ -398,7 +366,7 @@ def save_output(theme: str, results: dict) -> str:
 # エントリーポイント
 # ─────────────────────────────────────────────────────────────
 
-DEFAULT_THEME = "2032年システム一括リプレース IT投資ポートフォリオ策定プロセス"
+DEFAULT_THEME = "2032年システムリプレースのポートフォリオ、製品ロードマップ作成"
 
 DEFAULT_BACKGROUND = """
 - 2032年に基幹システムを一括リプレース予定
@@ -414,27 +382,20 @@ DEFAULT_BACKGROUND = """
 
 async def main():
     theme = sys.argv[1] if len(sys.argv) > 1 else DEFAULT_THEME
-    background = DEFAULT_BACKGROUND
 
     print("=" * 60)
     print("経営資料作成マルチエージェントパイプライン")
     print("=" * 60)
     print(f"\nテーマ: {theme}")
-    print(f"\n背景:\n{background}")
-    print(f"\nモデル: {MODEL}")
+    print(f"\n背景:\n{DEFAULT_BACKGROUND}")
     print("\nパイプライン開始...\n")
 
-    results = await run_pipeline(theme, background)
+    results = await run_pipeline(theme, DEFAULT_BACKGROUND)
     filename = save_output(theme, results)
 
     print(f"\n{'=' * 60}")
     print(f"✅ 完了！  出力ファイル: {filename}")
     print(f"{'=' * 60}")
-
-    print("\n" + "=" * 60)
-    print("【最終資料（抜粋）】")
-    print("=" * 60)
-    print(results["revised"][:2000] + "..." if len(results["revised"]) > 2000 else results["revised"])
 
 
 if __name__ == "__main__":
